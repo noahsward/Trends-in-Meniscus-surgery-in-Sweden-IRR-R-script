@@ -1,0 +1,297 @@
+packages <- c("readxl", "dplyr", "tidyr", "ggplot2", "writexl", "MASS")
+
+missing_packages <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(writexl)
+library(MASS)
+
+file_path <- file.choose()
+
+raw <- as.data.frame(
+  read_excel(file_path, col_names = FALSE, .name_repair = "minimal")
+)
+
+if (ncol(raw) != 45) {
+  stop(paste0(
+    "Expected 45 columns: Year plus 22 Count/Population pairs. Found ",
+    ncol(raw),
+    ". Please select the correct Excel file and check its layout."
+  ))
+}
+
+region_headers <- as.character(unlist(raw[1, -1], use.names = FALSE))
+
+for (i in seq_along(region_headers)) {
+  if (is.na(region_headers[i]) || trimws(region_headers[i]) == "") {
+    if (i > 1) {
+      region_headers[i] <- region_headers[i - 1]
+    }
+  }
+}
+
+region_names <- region_headers[seq(1, length(region_headers), by = 2)]
+
+expected_regions <- c(
+  "Riket",
+  "Stockholms län",
+  "Uppsala län",
+  "Södermanlands län",
+  "Östergötlands län",
+  "Jönköpings län",
+  "Kronobergs län",
+  "Kalmar län",
+  "Gotlands län",
+  "Blekinge län",
+  "Skåne län",
+  "Hallands län",
+  "Västra Götalands län",
+  "Värmlands län",
+  "Örebro län",
+  "Västmanlands län",
+  "Dalarnas län",
+  "Gävleborgs län",
+  "Västernorrlands län",
+  "Jämtlands län",
+  "Västerbottens län",
+  "Norrbottens län"
+)
+
+if (length(region_names) != 22 || !all(region_names == expected_regions)) {
+  stop(
+    "Region headers do not match the expected 22 regions. Check the first row of the Excel file."
+  )
+}
+
+data_rows <- raw[-c(1, 2), , drop = FALSE]
+
+data_rows$Year <- suppressWarnings(as.numeric(as.character(data_rows[[1]])))
+
+data_rows <- data_rows %>%
+  filter(!is.na(Year)) %>%
+  arrange(Year)
+
+if (nrow(data_rows) != 18) {
+  warning(paste("Expected 18 annual observations, found", nrow(data_rows)))
+}
+
+long_data <- bind_rows(
+  lapply(seq_along(region_names), function(i) {
+    count_col <- 2 + (i - 1) * 2
+    population_col <- count_col + 1
+
+    tibble(
+      Year = data_rows$Year,
+      Region = region_names[i],
+      Count = suppressWarnings(
+        as.numeric(as.character(data_rows[[count_col]]))
+      ),
+      Population = suppressWarnings(
+        as.numeric(as.character(data_rows[[population_col]]))
+      )
+    )
+  })
+) %>%
+  filter(
+    !is.na(Year),
+    !is.na(Count),
+    !is.na(Population),
+    Population > 0,
+    Count >= 0
+  ) %>%
+  mutate(Year_centered = Year - mean(Year, na.rm = TRUE))
+
+fit_region <- function(region_data) {
+
+  region_name <- unique(region_data$Region)
+
+  poisson_model <- tryCatch(
+    suppressWarnings(
+      glm(
+        Count ~ Year_centered + offset(log(Population)),
+        family = poisson(link = "log"),
+        data = region_data
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  if (is.null(poisson_model)) {
+    return(tibble(
+      Region = region_name,
+      Total_years = nrow(region_data),
+      IRR = NA_real_,
+      CI_lower = NA_real_,
+      CI_upper = NA_real_,
+      P_value = NA_character_,
+      Annual_change_percent = NA_real_,
+      Pearson_dispersion = NA_real_,
+      Poisson_AIC = NA_real_,
+      Negative_binomial_AIC = NA_real_,
+      Selected_model = "Model failed"
+    ))
+  }
+
+  poisson_summary <- summary(poisson_model)
+  poisson_dispersion <- sum(
+    residuals(poisson_model, type = "pearson")^2
+  ) / df.residual(poisson_model)
+
+  negative_binomial_model <- tryCatch(
+    suppressWarnings(
+      MASS::glm.nb(
+        Count ~ Year_centered + offset(log(Population)),
+        data = region_data,
+        control = glm.control(maxit = 100)
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  if (poisson_dispersion > 1.5 && !is.null(negative_binomial_model)) {
+    selected_model <- negative_binomial_model
+    model_name <- "Negative binomial"
+  } else {
+    selected_model <- poisson_model
+    model_name <- "Poisson"
+  }
+
+  selected_summary <- summary(selected_model)
+  coefficients <- selected_summary$coefficients
+
+  if (!"Year_centered" %in% rownames(coefficients)) {
+    return(tibble(
+      Region = region_name,
+      Total_years = nrow(region_data),
+      IRR = NA_real_,
+      CI_lower = NA_real_,
+      CI_upper = NA_real_,
+      P_value = NA_character_,
+      Annual_change_percent = NA_real_,
+      Pearson_dispersion = poisson_dispersion,
+      Poisson_AIC = AIC(poisson_model),
+      Negative_binomial_AIC = if (!is.null(negative_binomial_model)) AIC(negative_binomial_model) else NA_real_,
+      Selected_model = "Coefficient unavailable"
+    ))
+  }
+
+  beta <- coefficients["Year_centered", "Estimate"]
+  standard_error <- coefficients["Year_centered", "Std. Error"]
+  p_value <- coefficients["Year_centered", ncol(coefficients)]
+
+  irr <- exp(beta)
+  ci_lower <- exp(beta - 1.96 * standard_error)
+  ci_upper <- exp(beta + 1.96 * standard_error)
+
+  tibble(
+    Region = region_name,
+    Total_years = nrow(region_data),
+    IRR = irr,
+    CI_lower = ci_lower,
+    CI_upper = ci_upper,
+    P_value = ifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    ),
+    Annual_change_percent = (irr - 1) * 100,
+    Pearson_dispersion = poisson_dispersion,
+    Poisson_AIC = AIC(poisson_model),
+    Negative_binomial_AIC = if (!is.null(negative_binomial_model)) {
+      AIC(negative_binomial_model)
+    } else {
+      NA_real_
+    },
+    Selected_model = model_name
+  )
+}
+
+results <- long_data %>%
+  group_by(Region) %>%
+  group_split() %>%
+  lapply(fit_region) %>%
+  bind_rows() %>%
+  mutate(
+    Region = factor(Region, levels = expected_regions)
+  ) %>%
+  arrange(Region) %>%
+  mutate(Region = as.character(Region))
+
+results_display <- results %>%
+  mutate(
+    IRR = round(IRR, 3),
+    CI_lower = round(CI_lower, 3),
+    CI_upper = round(CI_upper, 3),
+    Annual_change_percent = round(Annual_change_percent, 2),
+    Pearson_dispersion = round(Pearson_dispersion, 2),
+    Poisson_AIC = round(Poisson_AIC, 2),
+    Negative_binomial_AIC = round(Negative_binomial_AIC, 2)
+  )
+
+write_xlsx(
+  list(
+    IRR_results = results_display,
+    Data_used = long_data
+  ),
+  path = "IRR_Poisson_NegativeBinomial_results.xlsx"
+)
+
+plot_data <- results %>%
+  filter(
+    !is.na(IRR),
+    !is.na(CI_lower),
+    !is.na(CI_upper)
+  ) %>%
+  mutate(
+    Region = factor(Region, levels = rev(expected_regions)),
+    Significant = !is.na(P_value) & P_value != "NA" &
+      (P_value == "<0.001" | suppressWarnings(as.numeric(P_value)) < 0.05)
+  )
+
+forest_plot <- ggplot(
+  plot_data,
+  aes(x = IRR, y = Region)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_errorbar(
+    aes(xmin = CI_lower, xmax = CI_upper),
+    orientation = "y",
+    width = 0.2
+  ) +
+  geom_point(aes(shape = Significant), size = 2.5) +
+  scale_shape_manual(values = c(`TRUE` = 16, `FALSE` = 1)) +
+  labs(
+    title = "Annual incidence trends by region",
+    x = "Incidence rate ratio per year (95% CI)",
+    y = NULL,
+    shape = "P < 0.05"
+  ) +
+  theme_minimal(base_size = 11)
+
+ggsave(
+  "IRR_Poisson_NegativeBinomial_forest_plot.png",
+  plot = forest_plot,
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+
+print(results_display)
+print(forest_plot)
+
+cat("\nModel selection summary:\n")
+print(table(results$Selected_model, useNA = "ifany"))
+
+cat("\nFiles saved in the current working directory:\n")
+cat("IRR_Poisson_NegativeBinomial_results.xlsx\n")
+cat("IRR_Poisson_NegativeBinomial_forest_plot.png\n")
+
+print(results_display, n = Inf, width = Inf)
+
